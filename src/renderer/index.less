@@ -1,0 +1,31 @@
+/**
+ * 全局基础样式
+ * 作用：重置浏览器默认样式，设置整个应用的背景和布局基线。
+ * antd 的组件样式由 antd 自身管理，此处只写全局布局相关的内容。
+ */
+
+/* 重置所有元素的 margin / padding，统一盒模型为 border-box */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* 整个页面背景 */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  min-height: 100vh;     // 至少撑满整个视口高度
+  display: flex;
+  justify-content: center;  // 水平居中
+  align-items: center;      // 垂直居中
+}
+
+/* React 挂载根节点，撑满 body */
+#root {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 20px;
+}
