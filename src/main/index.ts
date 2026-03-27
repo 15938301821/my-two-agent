@@ -6,6 +6,7 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { config } from 'dotenv'
+import { allToolDefinitions, toolExecutors } from './tools/fileSystem'
 
 // 加载 .env 文件中的环境变量（如 DASHSCOPE_API_KEY）
 config()
@@ -49,10 +50,16 @@ function createWindow(): void {
 }
 
 /**
- * IPC 监听器：处理前端发来的对话请求
+ * IPC 监听器：处理前端发来的对话请求，支持 Tool Calling
  *
- * IPC（进程间通信）是 Electron 中前后端通信的方式：
- * 前端（渲染进程）--> preload.ts --> ipcRenderer.invoke('chat') --> 这里
+ * Tool Calling 工作流程：
+ * 1. 将用户消息 + 工具列表 发给大模型
+ * 2. 如果大模型决定调用工具（finish_reason === 'tool_calls'）：
+ *    a. 取出工具名称和参数
+ *    b. 执行对应的本地函数（如 getFileList）
+ *    c. 把结果作为 tool 消息插入对话历史
+ *    d. 再次调用大模型，循环直到大模型返回最终文字回复
+ * 3. 返回最终文字给前端
  */
 ipcMain.handle('chat', async (_event, messages) => {
   // 动态导入 OpenAI SDK（千问 API 兼容 OpenAI 接口格式）
@@ -64,15 +71,70 @@ ipcMain.handle('chat', async (_event, messages) => {
     baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',  // 百炼 API 地址
   })
 
-  // 调用千问3 Max 模型
-  const response = await client.chat.completions.create({
-    model: 'qwen3-max',  // 模型名称
-    messages,            // 对话历史（包含所有消息以支持多轮对话）
-    stream: false,       // 不使用流式输出，等待完整回复
-  })
+  // 复制一份对话历史，后续的工具调用结果会不断往里面插入
+  const conversationMessages = [...messages]
 
-  // 取出模型返回的文本内容
-  return response.choices[0]?.message?.content || ''
+  /**
+   * Tool Calling 循环：最多执行 5 轮（防止大模型无限循环调工具）
+   * 正常情况下 1-2 轮就会返回最终结果
+   */
+  for (let round = 0; round < 5; round++) {
+    // 调用千问3 Max，传入工具列表
+    const response = await client.chat.completions.create({
+      model: 'qwen3-max',
+      messages: conversationMessages,
+      tools: allToolDefinitions,     // 告诉大模型有哪些工具可用
+      tool_choice: 'auto',           // 让大模型自己决定是否调用工具
+      stream: false,
+    })
+
+    const choice = response.choices[0]
+
+    // 情况一：大模型直接返回文字回复（不需要工具）
+    if (choice.finish_reason === 'stop') {
+      return choice.message?.content || ''
+    }
+
+    // 情况二：大模型要求调用工具
+    if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls) {
+      // 将大模型的这条消息（包含 tool_calls 字段）加入历史
+      // 下次调用 API 时大模型才知道自己之前要求过什么
+      conversationMessages.push(choice.message)
+
+      // 逐个执行大模型要求的工具调用（只处理 function 类型）
+      for (const toolCall of choice.message.tool_calls) {
+        if (toolCall.type !== 'function') continue  // 跳过非 function 类型
+        const toolName = toolCall.function.name  // 工具名称，如 "get_file_list"
+        const executor = toolExecutors[toolName]  // 找到对应的执行函数
+
+        let toolResult: string
+        if (executor) {
+          // 解析大模型传来的 JSON 参数并执行工具
+          const args = JSON.parse(toolCall.function.arguments) as Record<string, unknown>
+          toolResult = executor(args)
+        } else {
+          // 工具不存在（应该不会发生，以防万一）
+          toolResult = `错误：未知工具 "${toolName}"，无法执行。`
+        }
+
+        // 将工具执行结果以 "tool" 角色插入历史
+        // 大模型下次就能看到工具返回了什么
+        conversationMessages.push({
+          role: 'tool' as const,
+          tool_call_id: toolCall.id,  // 必须匹配，大模型用此关联调用和结果
+          content: toolResult,
+        })
+      }
+
+      // 循环继续，带着工具结果再次调用大模型
+      continue
+    }
+
+    // 其他 finish_reason（如 length、content_filter）直接返回当前内容
+    return choice.message?.content || ''
+  }
+
+  return '请求处理超时，请稍后重试。'
 })
 
 /**
